@@ -1,127 +1,130 @@
-// src/App.jsx
-import { useEffect, useRef, useState } from "react";
+# server.py
+import asyncio
+import json
+import time
+from aiohttp import web
+from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.contrib.media import MediaBlackhole
+from av import VideoFrame
+from ultralytics import YOLO
 
-export default function App() {
-  const localVideoRef = useRef(null);
-  const pcRef = useRef(null);
-  const channelRef = useRef(null);
-  const [label, setLabel] = useState("-");
-  const [running, setRunning] = useState(false);
-  const [cameraEnabled, setCameraEnabled] = useState(true);
+# Load your YOLO hand gesture model
+yolo_model = YOLO(r"C:/Users/bugzx/OneDrive/Desktop/v0dev_codes/YOLOv10n_gestures.pt")
 
-  useEffect(() => {
-    return () => {
-      cleanup();
-    };
-  }, []);
+# Active peer connections
+PCS = set()
 
-  const cleanup = () => {
-    if (pcRef.current) {
-      pcRef.current.close();
-      pcRef.current = null;
-    }
-    const v = localVideoRef.current;
-    if (v && v.srcObject) {
-      v.srcObject.getTracks().forEach((t) => t.stop());
-      v.srcObject = null;
-    }
-  };
 
-  const start = async () => {
-    if (running) return;
+# ------------------ CORS Middleware ------------------
+@web.middleware
+async def cors_middleware(request, handler):
+    if request.method == "OPTIONS":
+        return web.Response(status=204)
+    resp = await handler(request)
+    resp.headers["Access-Control-Allow-Origin"] = request.headers.get("Origin", "*")
+    resp.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
 
-    const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-    localVideoRef.current.srcObject = stream;
 
-    const pc = new RTCPeerConnection();
-    pcRef.current = pc;
+# ------------------ Frame Processing ------------------
+async def consume_and_detect(track, send_label):
+    """Read frames from video, run YOLO, send best gesture label back."""
+    last_sent = 0.0
+    try:
+        while True:
+            frame: VideoFrame = await track.recv()
+            img = frame.to_ndarray(format="bgr24")
 
-    const dc = pc.createDataChannel("gestures");
-    channelRef.current = dc;
-    dc.onopen = () => console.log("DataChannel open");
-    dc.onmessage = (e) => {
-      try {
-        const { label, confidence } = JSON.parse(e.data);
-        setLabel(`${label} (${(confidence * 100).toFixed(1)}%)`);
-      } catch {
-        setLabel(String(e.data));
-      }
-    };
+            # Run YOLO on frame
+            results = yolo_model(img, verbose=False)
 
-    stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+            best_label, best_conf = None, 0.0
+            for r in results:
+                if getattr(r, "boxes", None) is None:
+                    continue
+                for b in r.boxes:
+                    conf = float(b.conf[0]) if b.conf is not None else 0.0
+                    cls_id = int(b.cls[0]) if b.cls is not None else -1
+                    if cls_id >= 0 and conf > best_conf:
+                        best_conf = conf
+                        best_label = r.names.get(cls_id, f"class_{cls_id}")
 
-    const offer = await pc.createOffer();
-    await pc.setLocalDescription(offer);
+            now = time.time()
+            if best_label and (now - last_sent) > 0.1:  # send every 100ms
+                payload = json.dumps({"label": best_label, "confidence": best_conf})
+                await send_label(payload)
+                last_sent = now
 
-    const resp = await fetch("http://localhost:8080/offer", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ sdp: offer.sdp, type: offer.type }),
-    });
-    const answer = await resp.json();
-    await pc.setRemoteDescription(answer);
+    except asyncio.CancelledError:
+        pass
 
-    setRunning(true);
-    setCameraEnabled(true);
-  };
 
-  const stop = () => {
-    setRunning(false);
-    cleanup();
-    setLabel("-");
-    setCameraEnabled(false);
-  };
+# ------------------ WebRTC Offer Handler ------------------
+async def offer(request: web.Request):
+    params = await request.json()
+    offer = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
 
-  const toggleCamera = () => {
-    const videoTrack = localVideoRef.current?.srcObject?.getVideoTracks()[0];
-    if (videoTrack) {
-      videoTrack.enabled = !videoTrack.enabled;
-      setCameraEnabled(videoTrack.enabled);
-    }
-  };
-  return (
-    <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", fontFamily: "system-ui" }}>
-      <div style={{ width: 900, maxWidth: "95vw" }}>
-        <h1 style={{ margin: 0 }}>Gesture Detection Using Python</h1>
-        <p style={{ marginTop: 8, opacity: 0.8 }}>
-          Your camera streams to Python. The server sends back the detected gesture label.
-        </p>
+    pc = RTCPeerConnection()
+    PCS.add(pc)
 
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 260px", gap: 16, alignItems: "start" }}>
-          <video
-            ref={localVideoRef}
-            autoPlay
-            playsInline
-            muted
-            style={{ width: "100%", borderRadius: 12, border: "1px solid #ddd", background: "#000" }}
-          />
-          <div style={{ padding: 16, border: "1px solid #eee", borderRadius: 12 }}>
-            <div style={{ fontSize: 14, opacity: 0.7, marginBottom: 6 }}>Detected gesture</div>
-            <div style={{ fontSize: 28, fontWeight: 700, marginBottom: 16 }}>{label}</div>
+    label_channel = {"send": None}
 
-            {!running ? (
-              <button onClick={start} style={btnStyle}>Start</button>
-            ) : (
-              <>
-                <button onClick={stop} style={{ ...btnStyle, background: "#e11d48", marginBottom: 8 }}>Stop</button>
-                <button onClick={toggleCamera} style={{ ...btnStyle, background: cameraEnabled ? "#facc15" : "#10b981" }}>
-                  {cameraEnabled ? "Disable Camera" : "Enable Camera"}
-                </button>
-              </>
-            )}
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
+    @pc.on("connectionstatechange")
+    async def on_state():
+        print("PC state:", pc.connectionState)
+        if pc.connectionState in ("failed", "closed", "disconnected"):
+            await pc.close()
+            PCS.discard(pc)
 
-const btnStyle = {
-  background: "#2563eb",
-  color: "white",
-  border: "none",
-  padding: "10px 16px",
-  borderRadius: 10,
-  cursor: "pointer",
-  fontWeight: 600,
-};
+    blackhole = MediaBlackhole()
+
+    @pc.on("datachannel")
+    def on_datachannel(channel):
+        print("DataChannel created:", channel.label)
+        if channel.label == "gestures":
+            async def send_label_async(text):
+                channel.send(text)
+            label_channel["send"] = send_label_async
+
+    @pc.on("track")
+    def on_track(track):
+        print("Incoming track:", track.kind)
+        if track.kind == "video":
+            async def send_label(payload):
+                if label_channel["send"]:
+                    await label_channel["send"](payload)
+
+            task = asyncio.create_task(consume_and_detect(track, send_label))
+
+            @track.on("ended")
+            async def on_ended():
+                task.cancel()
+        else:
+            blackhole.addTrack(track)
+
+    await pc.setRemoteDescription(offer)
+    answer = await pc.createAnswer()
+    await pc.setLocalDescription(answer)
+
+    return web.json_response(
+        {"sdp": pc.localDescription.sdp, "type": pc.localDescription.type}
+    )
+
+
+# ------------------ App Factory ------------------
+def make_app():
+    app = web.Application(middlewares=[cors_middleware])
+    app.router.add_route("OPTIONS", "/offer", lambda _: web.Response(status=204))
+    app.router.add_post("/offer", offer)
+
+    async def on_shutdown(app):
+        await asyncio.gather(*[pc.close() for pc in list(PCS)])
+
+    app.on_shutdown.append(on_shutdown)
+    return app
+
+
+if __name__ == "__main__":
+    web.run_app(make_app(), port=8080)
